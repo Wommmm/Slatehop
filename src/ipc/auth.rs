@@ -324,7 +324,7 @@ fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<PathBuf> {
 
 #[cfg(target_os = "macos")]
 #[inline]
-fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<PathBuf> {
+pub(super) fn peer_exe_canonical_path_by_pid(peer_pid: u32) -> ResultType<PathBuf> {
     const PROC_PIDPATH_BUF_SIZE: usize = libc::PROC_PIDPATHINFO_MAXSIZE as _;
     let mut buffer = vec![0u8; PROC_PIDPATH_BUF_SIZE];
     let length = unsafe {
@@ -472,6 +472,16 @@ fn portable_service_helper_is_trusted(
 fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -> ResultType<()> {
     let peer_exe = peer_exe_canonical_path_by_pid(peer_pid)?;
     let current_exe = current_exe_canonical_path()?;
+    #[cfg(target_os = "macos")]
+    if let Some(current_role) = crate::platform::macos::managed_host::role_for_path(&current_exe) {
+        let peer_role = crate::platform::macos::managed_host::role_for_path(&peer_exe);
+        if peer_role == Some(current_role)
+            || (postfix == crate::POSTFIX_SERVICE && peer_role.is_some())
+        {
+            return Ok(());
+        }
+        bail!("Peer executable is outside the expected managed host path for IPC '{postfix}'");
+    }
     if executable_paths_match(&peer_exe, &current_exe) {
         return Ok(());
     }
@@ -607,6 +617,10 @@ pub(crate) fn authorize_user_server_process(
     let Ok(peer_exe) = peer_exe_canonical_path_by_pid(peer_pid) else {
         return false;
     };
+    use crate::platform::macos::managed_host;
+    if managed_host::current_role().is_ok_and(|role| role.is_some()) {
+        return managed_host::role_for_path(&peer_exe) == Some(managed_host::Role::Main);
+    }
     let expected_path = PathBuf::from(format!(
         "/Applications/{}.app/Contents/MacOS/{}",
         crate::get_app_name(),

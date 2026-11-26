@@ -2,6 +2,8 @@
 // https://github.com/servo/core-foundation-rs
 // https://github.com/rust-windowing/winit
 
+#[path = "managed_host.rs"]
+pub(crate) mod managed_host;
 mod update_temp;
 mod verified_dmg;
 
@@ -224,6 +226,21 @@ pub fn install_service() -> bool {
 // No need to merge the existing dup code, because the code in these two functions are too critical.
 // New code should be written in a common function.
 pub fn is_installed_daemon(prompt: bool) -> bool {
+    if prompt {
+        if let Err(err) = managed_host::require_legacy_lifecycle() {
+            log::warn!("{err}");
+            return false;
+        }
+    } else {
+        match managed_host::current_role() {
+            Ok(Some(_)) => {
+                return Path::new(&managed_host::Role::Service.plist_path()).exists()
+                    && Path::new(&managed_host::Role::Main.plist_path()).exists();
+            }
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+    }
     let daemon = format!("{}_service.plist", crate::get_full_name());
     let agent = format!("{}_server.plist", crate::get_full_name());
     let agent_plist_file = format!("/Library/LaunchAgents/{}", agent);
@@ -395,33 +412,56 @@ fn write_plist_atomically(path: &str, body: &str) -> ResultType<()> {
 }
 
 pub fn write_plists() -> ResultType<()> {
-    let daemon_plist_path = format!(
-        "/Library/LaunchDaemons/com.carriez.{}_service.plist",
-        crate::get_app_name()
-    );
-    let agent_plist_path = format!(
-        "/Library/LaunchAgents/com.carriez.{}_server.plist",
-        crate::get_app_name()
-    );
+    let managed = managed_host::current_role()?.is_some();
+    let (daemon_plist_path, agent_plist_path) = if managed {
+        managed_host::verify_current_executable(managed_host::Role::Service)?;
+        managed_host::verify_protected_directory(Path::new("/Library/LaunchDaemons"))?;
+        managed_host::verify_protected_directory(Path::new("/Library/LaunchAgents"))?;
+        (
+            managed_host::Role::Service.plist_path(),
+            managed_host::Role::Main.plist_path(),
+        )
+    } else {
+        let app_name = crate::get_app_name();
+        (
+            format!("/Library/LaunchDaemons/com.carriez.{app_name}_service.plist"),
+            format!("/Library/LaunchAgents/com.carriez.{app_name}_server.plist"),
+        )
+    };
     let Some(daemon_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("daemon.plist") else {
         bail!("daemon.plist not found in embedded resources");
     };
-    let Some(daemon_plist_body) = daemon_plist.contents_utf8().map(correct_app_name) else {
+    let Some(daemon_plist_body) = daemon_plist.contents_utf8() else {
         bail!("Failed to read daemon.plist");
     };
     let Some(agent_plist) = PRIVILEGES_SCRIPTS_DIR.get_file("agent.plist") else {
         bail!("agent.plist not found in embedded resources");
     };
-    let Some(agent_plist_body) = agent_plist.contents_utf8().map(correct_app_name) else {
+    let Some(agent_plist_body) = agent_plist.contents_utf8() else {
         bail!("Failed to read agent.plist");
     };
-    write_plist_atomically(&daemon_plist_path, &daemon_plist_body)?;
-    write_plist_atomically(&agent_plist_path, &agent_plist_body)?;
+    let (daemon, agent) = if managed {
+        (
+            managed_host::launchd_plist(daemon_plist_body, managed_host::Role::Service)?,
+            managed_host::launchd_plist(agent_plist_body, managed_host::Role::Main)?,
+        )
+    } else {
+        (
+            correct_app_name(daemon_plist_body),
+            correct_app_name(agent_plist_body),
+        )
+    };
+    write_plist_atomically(&daemon_plist_path, &daemon)?;
+    write_plist_atomically(&agent_plist_path, &agent)?;
     log::info!("[write-plists] Wrote daemon and agent plists");
     Ok(())
 }
 
 pub fn uninstall_service(show_new_window: bool, sync: bool) -> bool {
+    if let Err(err) = managed_host::require_legacy_lifecycle() {
+        log::warn!("{err}");
+        return false;
+    }
     // to-do: do together with win/linux about refactory start/stop service
     if !is_installed_daemon(false) {
         return false;
@@ -932,10 +972,10 @@ pub fn block_input(_v: bool) -> (bool, String) {
 
 pub fn is_installed() -> bool {
     if let Ok(p) = std::env::current_exe() {
-        return p
-            .to_str()
-            .unwrap_or_default()
-            .starts_with(&format!("/Applications/{}.app", crate::get_app_name()));
+        return managed_host::role_for_path(&p).is_some()
+            || p.to_str()
+                .unwrap_or_default()
+                .starts_with(&format!("/Applications/{}.app", crate::get_app_name()));
     }
     false
 }
@@ -947,6 +987,7 @@ pub fn quit_gui() {
 }
 
 pub fn update_me() -> ResultType<()> {
+    managed_host::require_legacy_lifecycle()?;
     let cmd = std::env::current_exe()?;
     // RustDesk.app/Contents/MacOS/RustDesk
     let app_dir = cmd
@@ -1078,6 +1119,7 @@ fi
 }
 
 pub fn update_from_dmg(dmg_path: &str) -> ResultType<()> {
+    managed_host::require_legacy_lifecycle()?;
     let update_temp_dir = get_update_temp_dir_string();
     println!("Starting update from DMG: {}", dmg_path);
     let update_result = (|| {
@@ -1100,6 +1142,7 @@ pub fn update_to_verified_dmg(
     expected_sha256: &str,
     expected_size: Option<u64>,
 ) -> ResultType<()> {
+    managed_host::require_legacy_lifecycle()?;
     let verified_dmg = copy_and_verify_dmg_file(file, expected_sha256, expected_size)?;
     update_from_verified_dmg(&verified_dmg)?;
     // Remove the private DMG copy before this process exits.
@@ -1209,6 +1252,7 @@ fn verify_update_app_identity(installed: &Path, candidate: &Path) -> ResultType<
 /// Performs a silent update from a DMG file without any osascript dialog.
 /// Must be called from a process running as root (e.g. the service binary).
 pub fn update_from_dmg_as_root(dmg_path: &str, expected_version: &str) -> ResultType<()> {
+    managed_host::require_legacy_lifecycle()?;
     let app_name = crate::get_app_name();
     validate_install_app_name(&app_name)?;
     let app_bundle = format!("/Applications/{}.app", app_name);

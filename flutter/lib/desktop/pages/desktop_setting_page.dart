@@ -28,6 +28,8 @@ import 'package:url_launcher/url_launcher_string.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
 import '../widgets/copper_connection_surface.dart';
+import '../widgets/rental_password_settings.dart';
+import '../widgets/slatehop_about.dart';
 import 'connection_page.dart' show requestMacConnectionBackdrop;
 
 const double _kTabWidth = 200;
@@ -56,6 +58,7 @@ class _TabInfo {
 enum SettingsTabKey {
   general,
   safety,
+  rentalPassword,
   network,
   display,
   account,
@@ -75,6 +78,8 @@ class DesktopSettingPage extends StatefulWidget {
         !bind.isDisableSettings() &&
         bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) != 'Y')
       SettingsTabKey.safety,
+    if (isMacOS && !isWeb && !bind.isDisableSettings())
+      SettingsTabKey.rentalPassword,
     if (!bind.isDisableSettings() &&
         bind.mainGetBuildinOption(key: kOptionHideNetworkSetting) != 'Y')
       SettingsTabKey.network,
@@ -207,6 +212,10 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           settingTabs.add(_TabInfo(tab, 'Security',
               Icons.enhanced_encryption_outlined, Icons.enhanced_encryption));
           break;
+        case SettingsTabKey.rentalPassword:
+          settingTabs.add(_TabInfo(tab, 'Rental period',
+              Icons.vpn_key_outlined, Icons.vpn_key));
+          break;
         case SettingsTabKey.network:
           settingTabs
               .add(_TabInfo(tab, 'Network', Icons.link_outlined, Icons.link));
@@ -241,6 +250,13 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           break;
         case SettingsTabKey.safety:
           children.add(const _Safety());
+          break;
+        case SettingsTabKey.rentalPassword:
+          children.add(ListView(children: [
+            _Card(title: 'Rental period', children: [
+              RentalPasswordSettings(hostExecutable: Platform.resolvedExecutable),
+            ]),
+          ]));
           break;
         case SettingsTabKey.network:
           children.add(const _Network());
@@ -376,6 +392,16 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
     return Obx(() {
       final selected = tab.key == selectedTab.value;
       final accent = _glassSettings ? MacGlassColors.accent : _accentColor;
+      final label = translate(tab.label);
+      final text = Text(
+        label,
+        maxLines: tab.key == SettingsTabKey.rentalPassword ? 1 : null,
+        overflow: tab.key == SettingsTabKey.rentalPassword ? TextOverflow.ellipsis : null,
+        style: TextStyle(
+            color: selected ? accent : null,
+            fontWeight: FontWeight.w400,
+            fontSize: _kContentFontSize),
+      );
       return Container(
         margin: _glassSettings
             ? const EdgeInsets.symmetric(horizontal: 8, vertical: 2)
@@ -411,13 +437,10 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
               color: selected ? accent : null,
               size: 20,
             ).marginOnly(left: 13, right: 10),
-            Text(
-              translate(tab.label),
-              style: TextStyle(
-                  color: selected ? accent : null,
-                  fontWeight: FontWeight.w400,
-                  fontSize: _kContentFontSize),
-            ),
+            if (tab.key == SettingsTabKey.rentalPassword)
+              Flexible(child: Tooltip(message: label, child: text))
+            else
+              text,
           ]),
         ),
       );
@@ -2622,6 +2645,18 @@ class _AboutState extends State<_About> {
       final buildDate = data['buildDate'].toString();
       final fingerprint = data['fingerprint'].toString();
       final myId = data['myId'].toString();
+      if (isMacOS && !isWeb) {
+        return SingleChildScrollView(
+          child: _Card(title: 'About SlateHop', children: [
+            SlateHopAbout(
+              version: version,
+              buildDate: buildDate,
+              fingerprint: fingerprint,
+              deviceId: myId,
+            ),
+          ]),
+        );
+      }
       const linkStyle = TextStyle(decoration: TextDecoration.underline);
       final scrollController = ScrollController();
       return SingleChildScrollView(

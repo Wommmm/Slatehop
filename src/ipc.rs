@@ -382,6 +382,17 @@ pub enum Data {
     // Debug for the payload is explicitly redacted; no generic Config string.
     RentalProvision(crate::rental::ProvisionRequest),
     RentalProvisionResult(Option<crate::rental::Policy>),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    RentalProvisionTransaction(String, crate::rental::ProvisionRequest),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    RentalProvisionBarrier,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    RentalProvisionBarrierReady(bool),
+    #[cfg(target_os = "macos")]
+    RentalAdminInspect(Option<crate::rental::Policy>),
+    // Some(recovery_required) for a verified host and trusted authority files.
+    #[cfg(target_os = "macos")]
+    RentalAdminInspected(Option<bool>),
     Options(Option<HashMap<String, String>>),
     NatType(Option<i32>),
     ConfirmedKey(Option<(Vec<u8>, Vec<u8>)>),
@@ -853,20 +864,62 @@ impl Drop for CheckIfRestart {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn authorize_rental_administration(stream: &Connection) -> bool {
+    if !crate::rental::administrator_peer(stream.peer_uid()) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    match crate::platform::macos::managed_host::current_role() {
+        Ok(Some(_)) => {
+            return ipc_auth::ensure_peer_executable_matches_current_by_pid_opt(stream.peer_pid(), "")
+                .is_ok();
+        }
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    true
+}
+
 async fn handle(data: Data, stream: &mut Connection) {
     match data {
-        Data::RentalProvision(request) => {
-            // Provisioning is narrower than ordinary user settings. On the Mac
-            // and Linux product only a kernel-authenticated root peer may write.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let permitted = crate::rental::administrator_peer(stream.peer_uid());
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let permitted = false;
-            let accepted = if permitted {
-                crate::trusted_devices::config::update(move || crate::rental::provision(request))
-                    .await.ok()
-            } else { None };
+        Data::RentalProvision(_) => {
+            // Older local messages have no transaction fence.
+            allow_err!(stream.send(&Data::RentalProvisionResult(None)).await);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Data::RentalProvisionTransaction(id, request) => {
+            let accepted = if authorize_rental_administration(stream) {
+                crate::trusted_devices::config::update(move || {
+                    crate::rental::provision_transaction(id, request)
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
             allow_err!(stream.send(&Data::RentalProvisionResult(accepted)).await);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Data::RentalProvisionBarrier => {
+            let ready = authorize_rental_administration(stream)
+                && crate::trusted_devices::config::update(crate::rental::provision_barrier)
+                    .await
+                    .is_ok();
+            allow_err!(stream.send(&Data::RentalProvisionBarrierReady(ready)).await);
+        }
+        #[cfg(target_os = "macos")]
+        Data::RentalAdminInspect(policy) => {
+            let checked = if authorize_rental_administration(stream) {
+                crate::trusted_devices::config::update(move || {
+                    crate::rental::verify_admin_policy(policy)
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
+            allow_err!(stream.send(&Data::RentalAdminInspected(checked)).await);
         }
         Data::SystemInfo(_) => {
             let info = format!(
@@ -908,13 +961,21 @@ async fn handle(data: Data, stream: &mut Connection) {
                     }
                     #[cfg(target_os = "macos")]
                     {
+                        use crate::platform::macos::managed_host;
                         // our launchagent interval is 1 second
                         hbb_common::sleep(1.5).await;
-                        std::process::Command::new("open")
-                            .arg("-n")
-                            .arg(&format!("/Applications/{}.app", crate::get_app_name()))
-                            .spawn()
-                            .ok();
+                        if let Ok(role) = managed_host::current_role() {
+                            let bundle = if role.is_some() {
+                                managed_host::APP_BUNDLE.to_owned()
+                            } else {
+                                format!("/Applications/{}.app", crate::get_app_name())
+                            };
+                            std::process::Command::new("open")
+                                .arg("-n")
+                                .arg(bundle)
+                                .spawn()
+                                .ok();
+                        }
                     }
                     // leave above open a little time
                     hbb_common::sleep(0.3).await;
@@ -1516,13 +1577,13 @@ fn select_server_uid_for_user_main_ipc(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
+fn running_servers_for_current_exe() -> ResultType<Vec<(u32, u32)>> {
     let current_exe = std::env::current_exe()?;
     let current_exe_path = std::fs::canonicalize(&current_exe)?;
     let current_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
     let mut sys = hbb_common::sysinfo::System::new();
     sys.refresh_processes();
-    let mut server_uids = Vec::new();
+    let mut servers = Vec::new();
     for process in sys.processes().values() {
         if process.pid() == current_pid {
             continue;
@@ -1542,14 +1603,14 @@ fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
             // than silently skipping it; `--server` is not expected to exit frequently.
             bail!("Failed to read --server process uid");
         };
-        server_uids.push(uid);
+        servers.push((uid, process.pid().as_u32()));
     }
-    Ok(server_uids)
+    Ok(servers)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn user_main_ipc_server_uid() -> ResultType<u32> {
-    let server_uids = running_server_uids_for_current_exe()?;
+    let server_uids: Vec<_> = running_servers_for_current_exe()?.into_iter().map(|(uid, _)| uid).collect();
     #[cfg(target_os = "linux")]
     let prefer_root = crate::platform::linux::is_login_screen_wayland();
     #[cfg(target_os = "macos")]
@@ -2482,16 +2543,180 @@ mod test {
 /// Local administrator call. Never places provisioning fields in argv or logs.
 #[tokio::main(flavor = "current_thread")]
 pub async fn provision_rental(request: crate::rental::ProvisionRequest) -> ResultType<()> {
-    let mut connection = connect(1_000, "").await?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let uid = connection.peer_uid().ok_or_else(|| hbb_common::anyhow::anyhow!("Unknown serving daemon identity"))?;
+    {
+        #[cfg(target_os = "macos")]
+        use crate::platform::macos::managed_host;
+        #[cfg(target_os = "macos")]
+        if managed_host::current_role()?.is_some() {
+            bail!("Use the SlateHop host administrator to manage rental credentials");
+        }
+        #[cfg(target_os = "linux")]
+        let writer = crate::rental::AuthorityWrite::acquire()?;
+        let mut connection = connect(1_000, "").await?;
+        let uid = connection
+            .peer_uid()
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("Unknown serving daemon identity"))?;
+        #[cfg(target_os = "macos")]
+        let writer = {
+            let Some(pid) = connection.peer_pid() else {
+                bail!("Could not verify the serving process for stdin provisioning");
+            };
+            let executable = ipc_auth::peer_exe_canonical_path_by_pid(pid)?;
+            if managed_host::role_for_path(&executable).is_some() {
+                bail!("Use the SlateHop host administrator to manage rental credentials");
+            }
+            crate::rental::AuthorityWrite::acquire()?
+        };
+        drain_rental_provisioning(&writer, &mut connection, uid).await?;
+        deliver_rental(&writer, &mut connection, uid, request).await?;
+        Ok(())
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let uid = return Err(hbb_common::anyhow::anyhow!("Rental administrator delivery unsupported on this platform"));
+    {
+        drop(request);
+        bail!("Rental administrator delivery unsupported on this platform");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn drain_rental_provisioning(
+    writer: &crate::rental::AuthorityWrite,
+    connection: &mut ConnectionTmpl<ConnClient>,
+    uid: u32,
+) -> ResultType<()> {
+    writer.fence(uid)?;
+    timeout(1_000, connection.send(&Data::RentalProvisionBarrier)).await??;
+    if !matches!(
+        connection.next_timeout(10_000).await?,
+        Some(Data::RentalProvisionBarrierReady(true))
+    ) {
+        bail!("Serving daemon could not confirm rental provisioning had stopped");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn deliver_rental(
+    writer: &crate::rental::AuthorityWrite,
+    connection: &mut ConnectionTmpl<ConnClient>,
+    uid: u32,
+    request: crate::rental::ProvisionRequest,
+) -> ResultType<crate::rental::Policy> {
     let window = request.window();
-    crate::rental::begin_administrator_delivery(uid)?;
-    connection.send(&Data::RentalProvision(request)).await?;
-    match connection.next_timeout(10_000).await? {
-        Some(Data::RentalProvisionResult(Some(policy))) => crate::rental::commit_administrator_delivery(uid, policy, window),
-        _ => bail!("Rental provisioning was not accepted by the serving daemon"),
+    let id = writer.start_transaction(uid)?;
+    let result = async {
+        timeout(
+            1_000,
+            connection.send(&Data::RentalProvisionTransaction(id, request)),
+        )
+        .await??;
+        match connection.next_timeout(10_000).await? {
+            Some(Data::RentalProvisionResult(Some(policy))) => {
+                writer.commit(uid, &policy, window)?;
+                writer.finish_transaction(uid)?;
+                Ok(policy)
+            }
+            _ => bail!("Rental provisioning was not accepted by the serving daemon"),
+        }
+    }
+    .await;
+    if result.is_err() {
+        // Still holding the root writer lock. Leave the interrupted transaction
+        // visible for status while preventing queued workers from using its ID.
+        writer.fence(uid)?;
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn verify_rental_admin_executable() -> ResultType<()> {
+    use crate::platform::macos::managed_host;
+    managed_host::verify_current_executable(managed_host::Role::Main)
+}
+
+#[cfg(target_os = "macos")]
+async fn connect_rental_admin() -> ResultType<(u32, ConnectionTmpl<ConnClient>)> {
+    let servers = running_servers_for_current_exe()?;
+    let (uid, expected_pid) = match servers.as_slice() {
+        [] => bail!("No installed host server is running"),
+        &[server] => server,
+        _ => bail!("Multiple installed host servers are running"),
+    };
+    let connection = connect_with_path(1_000, &Config::ipc_path_for_uid(uid, "")).await?;
+    let peer_pid = connection.peer_pid();
+    if connection.peer_uid() != Some(uid) || peer_pid != Some(expected_pid) {
+        bail!("Could not verify the serving host process");
+    }
+    ipc_auth::ensure_peer_executable_matches_current_by_pid_opt(peer_pid, "")?;
+    Ok((uid, connection))
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn rental_admin(
+    command: crate::rental::AdminCommand,
+) -> ResultType<crate::rental::AdminReply> {
+    use crate::rental::{
+        self, AdminCommand, AdminReply, AdminStatus, AuthorityWrite, ProvisionRequest,
+    };
+    verify_rental_admin_executable()?;
+    let writer = match command {
+        AdminCommand::Status => None,
+        _ => Some(AuthorityWrite::acquire()?),
+    };
+    let (uid, mut connection) = connect_rental_admin().await?;
+    if let Some(writer) = &writer {
+        drain_rental_provisioning(writer, &mut connection, uid).await?;
+    }
+    let (policy, interrupted) = rental::read_admin_policy(uid)?;
+    timeout(
+        1_000,
+        connection.send(&Data::RentalAdminInspect(policy.clone())),
+    )
+    .await??;
+    let recovery_required = match connection.next_timeout(10_000).await? {
+        Some(Data::RentalAdminInspected(Some(recovery))) => recovery || interrupted,
+        _ => bail!("Host could not verify its current rental policy and credential"),
+    };
+
+    let now = rental::now_ms()?;
+    match command {
+        AdminCommand::Status => Ok(AdminReply {
+            status: AdminStatus::verified(policy.as_ref(), now, recovery_required)?,
+            password: None,
+        }),
+        AdminCommand::SetExpiry(expiry) => {
+            if recovery_required {
+                bail!("Rental host requires a new password before changing expiration");
+            }
+            let mut policy = policy.ok_or_else(|| {
+                hbb_common::anyhow::anyhow!("Rental host has no configured policy")
+            })?;
+            let status = policy.set_expiry(now, expiry)?;
+            writer
+                .as_ref()
+                .expect("authority writer for expiry")
+                .commit(uid, &policy, policy.window())?;
+            Ok(AdminReply {
+                status,
+                password: None,
+            })
+        }
+        AdminCommand::NewPassword(expiry) => {
+            let request = ProvisionRequest::generated(policy.as_ref(), now, expiry)?;
+            let policy = deliver_rental(
+                writer.as_ref().expect("authority writer for password"),
+                &mut connection,
+                uid,
+                request.clone(),
+            )
+            .await?;
+            let status = AdminStatus::from_policy(Some(&policy), rental::now_ms()?)?;
+            Ok(AdminReply {
+                status,
+                password: Some(request.into_password()),
+            })
+        }
     }
 }

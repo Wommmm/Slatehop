@@ -1,5 +1,288 @@
 use super::*;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rental_admin_recovers_missing_credentials_and_rejects_corrupt_storage() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    sodiumoxide::init().unwrap();
+    let dir = fixture();
+    let path = dir.join("credential.toml");
+    let salt = "synthetic-salt";
+    let storage = encrypted_storage("synthetic-password", salt);
+    let policy = Policy {
+        version: 1,
+        credential_binding: binding(&storage, salt).unwrap(),
+        valid_from_ms: 100,
+        valid_until_ms: 200,
+    };
+    let needs_recovery = |memory, salt| admin_credential_recovery(&policy, memory, salt, &path);
+    assert!(needs_recovery(&storage, salt).unwrap());
+    let valid = format!("password = \"{storage}\"\nsalt = \"{salt}\"\n");
+    write_private(&path, valid.as_bytes()).unwrap();
+    assert!(!needs_recovery(&storage, salt).unwrap());
+    assert!(needs_recovery("", salt).unwrap());
+    assert!(needs_recovery(&storage, "").unwrap());
+    assert!(needs_recovery("unsupported", "").is_err());
+
+    for missing in ["id = 'fixture'", "password = ''\nsalt = ''"] {
+        write_private(&path, missing.as_bytes()).unwrap();
+        assert!(needs_recovery(&storage, salt).unwrap());
+    }
+    write_private(&path, format!("password = \"{storage}\"").as_bytes()).unwrap();
+    assert!(needs_recovery(&storage, salt).unwrap());
+    for corrupt in [
+        "password = [",
+        "password = 17",
+        "salt = false",
+        "password = 'unsupported'",
+    ] {
+        write_private(&path, corrupt.as_bytes()).unwrap();
+        assert!(needs_recovery("", "").is_err());
+    }
+
+    write_private(&path, valid.as_bytes()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(needs_recovery("", "").is_err());
+    fs::remove_file(&path).unwrap();
+    symlink(dir.join("missing-target"), &path).unwrap();
+    assert!(needs_recovery("", "").is_err());
+    fs::remove_dir_all(dir).unwrap();
+    assert!(needs_recovery("", "").is_err());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rental_fenced_transaction_rejects_late_work_and_drains_running_write() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let dir = fixture();
+    let pending = dir.join("pending");
+    let uid = serving_uid();
+    let old = "0123456789abcdef0123456789abcdef";
+    let next = "abcdef0123456789abcdef0123456789";
+    write_owned(&pending, old.as_bytes(), uid, 0o644).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let pending = pending.as_path();
+        scope.spawn(move || {
+            with_provision_transaction(pending, uid, old, || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        fence_transaction(pending, uid).unwrap();
+        scope.spawn(move || {
+            waiting_tx.send(()).unwrap();
+            provision_barrier().unwrap();
+            drained_tx.send(()).unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let before_release = drained_rx.recv_timeout(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        assert_eq!(before_release, Err(mpsc::RecvTimeoutError::Timeout));
+        drained_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let try_stale = || {
+            with_provision_transaction(pending, uid, old, || -> ResultType<()> {
+                panic!("fenced request reached persistence")
+            })
+        };
+        assert!(try_stale().is_err());
+        write_owned(pending, next.as_bytes(), uid, 0o644).unwrap();
+        assert!(try_stale().is_err());
+        assert_eq!(
+            with_provision_transaction(pending, uid, next, || Ok(42)).unwrap(),
+            42
+        );
+    });
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rental_recovery_requires_trusted_authority_and_preserves_known_window() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let dir = fixture();
+    let marker = dir.join("enabled");
+    let snapshot = dir.join("policy");
+    let pending = dir.join("pending");
+    let uid = serving_uid();
+    let inspect = || read_authority(&marker, &snapshot, &pending, uid);
+    assert_eq!(inspect().unwrap(), (None, false));
+    write_owned(&marker, AUTHORITY_MARKER, uid, 0o644).unwrap();
+    let (policy, interrupted) = inspect().unwrap();
+    let recovery = AdminStatus::verified(policy.as_ref(), 150, interrupted).unwrap();
+    assert_eq!(recovery.state, "recovery_required");
+    assert_eq!(
+        (recovery.valid_from_ms, recovery.valid_until_ms),
+        (None, None)
+    );
+
+    let policy = Policy {
+        version: 1,
+        credential_binding: "ab".repeat(32),
+        valid_from_ms: 100,
+        valid_until_ms: 200,
+    };
+    write_owned(&snapshot, &serde_json::to_vec(&policy).unwrap(), uid, 0o644).unwrap();
+    let (snapshot_policy, interrupted) = inspect().unwrap();
+    assert!(!interrupted);
+    let mismatch = credential_binding_mismatch(
+        &snapshot_policy.unwrap(),
+        &"cd".repeat(32),
+        &"ab".repeat(32),
+    );
+    let recovery = AdminStatus::verified(Some(&policy), 150, mismatch).unwrap();
+    assert_eq!(recovery.state, "recovery_required");
+    assert_eq!(
+        (recovery.valid_from_ms, recovery.valid_until_ms),
+        (Some(100), Some(200))
+    );
+    assert!(!credential_binding_mismatch(
+        &policy,
+        &"ab".repeat(32),
+        &"ab".repeat(32)
+    ));
+    assert!(credential_binding_mismatch(
+        &policy,
+        &"ab".repeat(32),
+        &"cd".repeat(32)
+    ));
+
+    write_owned(&pending, FENCED_TRANSACTION, uid, 0o644).unwrap();
+    assert_eq!(inspect().unwrap(), (Some(policy), true));
+
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(inspect().is_err());
+    fs::remove_file(&snapshot).unwrap();
+    symlink(&marker, &snapshot).unwrap();
+    assert!(inspect().is_err());
+    fs::remove_file(&snapshot).unwrap();
+    write_owned(&pending, b"bad", uid, 0o644).unwrap();
+    assert!(inspect().is_err());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rental_admin_uses_host_time_and_expiry_preserves_binding() {
+    let mut policy = Policy {
+        version: 1,
+        credential_binding: "ab".repeat(32),
+        valid_from_ms: 100,
+        valid_until_ms: 200,
+    };
+    let unconfigured = AdminReply {
+        status: AdminStatus::from_policy(None, 99).unwrap(),
+        password: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&unconfigured).unwrap(),
+        serde_json::json!({
+            "state": "unconfigured",
+            "now_ms": 99,
+            "valid_from_ms": null,
+            "valid_until_ms": null,
+        })
+    );
+    assert_eq!(
+        AdminStatus::from_policy(Some(&policy), 99).unwrap().state,
+        "pending"
+    );
+    assert_eq!(
+        AdminStatus::from_policy(Some(&policy), 100).unwrap().state,
+        "active"
+    );
+    assert_eq!(
+        AdminStatus::from_policy(Some(&policy), 200).unwrap().state,
+        "expired"
+    );
+    let original = serde_json::to_vec(&policy).unwrap();
+    assert!(policy.set_expiry(199, 199).is_err());
+    assert!(policy.set_expiry(99, 100).is_err());
+    assert!(policy.set_expiry(200, MAX_TIMESTAMP_MS + 1).is_err());
+    assert_eq!(serde_json::to_vec(&policy).unwrap(), original);
+
+    let status = policy.set_expiry(200, 300).unwrap();
+    assert_eq!(status.state, "active");
+    assert_eq!(status.valid_from_ms, Some(100));
+    assert_eq!(status.valid_until_ms, Some(300));
+    assert_eq!(policy.credential_binding, "ab".repeat(32));
+    assert!(serde_json::to_value(status)
+        .unwrap()
+        .get("password")
+        .is_none());
+}
+
+#[test]
+fn rental_admin_command_rejects_wrong_caller_and_invalid_arguments() {
+    let parse = |uid, args: &[&str]| {
+        AdminCommand::parse(
+            Some(uid),
+            &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert!(parse(501, &["--rental-admin-status"]).is_err());
+    assert!(parse(0, &["--rental-admin-status", "1"]).is_err());
+    assert!(parse(0, &["--rental-admin-set-expiry", "+123"]).is_err());
+    assert!(parse(0, &["--rental-admin-new-password", "0"]).is_err());
+    assert!(parse(0, &["--rental-admin-new-password", "253402300800000"]).is_err());
+    assert!(matches!(
+        parse(0, &["--rental-admin-set-expiry", "123"]),
+        Ok(AdminCommand::SetExpiry(123))
+    ));
+    assert!(matches!(
+        parse(0, &["--rental-admin-new-password", "123"]),
+        Ok(AdminCommand::NewPassword(123))
+    ));
+}
+
+#[test]
+fn rental_generated_password_uses_the_existing_window_start_on_reset() {
+    sodiumoxide::init().unwrap();
+    let first = ProvisionRequest::generated(None, 100, 200).unwrap();
+    assert_eq!(first.window(), (100, 200));
+    let policy = Policy {
+        version: 1,
+        credential_binding: "ab".repeat(32),
+        valid_from_ms: 100,
+        valid_until_ms: 200,
+    };
+    let reset = ProvisionRequest::generated(Some(&policy), 150, 200).unwrap();
+    assert_eq!(reset.window(), (100, 200));
+    assert_eq!(reset.password.len(), 32);
+    assert!(first.password != reset.password);
+    assert!(!format!("{reset:?}").contains(&reset.password));
+    assert!(ProvisionRequest::generated(Some(&policy), 200, 200).is_err());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rental_authority_lock_rejects_overlapping_writers_and_unsafe_paths() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = fixture();
+    let path = dir.join("administrator.lock");
+    let writer = AuthorityWrite::lock_file(&path).unwrap();
+    assert!(AuthorityWrite::lock_file(&path).is_err());
+    drop(writer);
+    assert!(AuthorityWrite::lock_file(&path).is_ok());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(AuthorityWrite::lock_file(&path).is_err());
+    fs::remove_file(&path).unwrap();
+    let victim = dir.join("unrelated");
+    fs::write(&victim, b"unchanged").unwrap();
+    symlink(&victim, &path).unwrap();
+    assert!(AuthorityWrite::lock_file(&path).is_err());
+    assert_eq!(fs::read(victim).unwrap(), b"unchanged");
+    fs::remove_dir_all(dir).unwrap();
+}
+
 fn fixture() -> PathBuf {
     let path = std::env::temp_dir().join(format!("rd-rental-test-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&path).unwrap();

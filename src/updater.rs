@@ -4,10 +4,7 @@ mod download;
 use crate::common::do_check_software_update;
 use artifact::verified_update_artifact_from_release_page_url;
 pub(crate) use artifact::{current_update_arch, current_update_format, current_update_platform};
-pub use artifact::{
-    current_update_artifact_query, get_update_download_file_from_url,
-    verified_update_artifact_for_download_url, verified_update_artifact_for_release_page_url,
-};
+pub use artifact::{current_update_artifact_query, get_update_download_file_from_url};
 use base::config::keys;
 use download::ensure_verified_update_artifact;
 pub(crate) use download::remove_update_file;
@@ -97,6 +94,23 @@ pub fn update_controlling_session_count(count: usize) {
     CONTROLLING_SESSION_COUNT.store(count, Ordering::SeqCst);
 }
 
+pub fn verified_update_artifact_for_release_page_url(
+    release_page_url: &str,
+    query: crate::update_metadata::UpdateArtifactQuery<'_>,
+) -> ResultType<crate::update_metadata::VerifiedUpdateArtifact> {
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::managed_host::require_legacy_lifecycle()?;
+    artifact::verified_update_artifact_for_release_page_url(release_page_url, query)
+}
+
+pub fn verified_update_artifact_for_download_url(
+    download_url: &str,
+) -> ResultType<crate::update_metadata::VerifiedUpdateArtifact> {
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::managed_host::require_legacy_lifecycle()?;
+    artifact::verified_update_artifact_for_download_url(download_url)
+}
+
 #[allow(dead_code)]
 pub fn start_auto_update() {
     let _sender = TX_MSG.lock().unwrap();
@@ -104,6 +118,8 @@ pub fn start_auto_update() {
 
 #[allow(dead_code)]
 pub fn manually_check_update() -> ResultType<()> {
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::managed_host::require_legacy_lifecycle()?;
     let sender = TX_MSG.lock().unwrap();
     sender.send(UpdateMsg::CheckUpdate)?;
     Ok(())
@@ -472,6 +488,9 @@ fn wait_for_failed_update_retry() {
 /// Called from `start_os_service()` which runs as root via LaunchDaemon.
 #[cfg(target_os = "macos")]
 pub fn start_auto_update_macos() {
+    if !matches!(crate::platform::macos::managed_host::current_role(), Ok(None)) {
+        return;
+    }
     let spawn_result = std::thread::Builder::new()
         .name("rustdesk-auto-update".to_owned())
         .spawn(|| {
@@ -513,6 +532,9 @@ pub fn start_auto_update_macos() {
 
 #[cfg(target_os = "macos")]
 pub fn check_update_as_root() -> ResultType<bool> {
+    if crate::platform::macos::managed_host::current_role()?.is_some() {
+        return Ok(false);
+    }
     let _update_lock = acquire_mac_update_lock()?;
     // Allow-auto-update setting
     if !config::Config::get_bool_option(keys::OPTION_ALLOW_AUTO_UPDATE) {

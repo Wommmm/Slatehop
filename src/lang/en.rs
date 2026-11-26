@@ -312,5 +312,13 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("api_server_empty_tip", "With API Server empty, your custom server defaults to HTTP. Contact your administrator to enable HTTPS."),
         ("android-logs-folder-tip", "Choose Android → media to store log files."),
         ("install-directory-not-empty-tip", "The selected folder is not empty. Installation may delete existing data. Consider choosing a different folder."),
+        ("Rental and password", "Rental and password"),
+        ("Open host administration", "Open host administration"),
+        ("Open demo", "Open demo"),
+        ("Rental settings demo uses sample data only.", "Rental settings demo uses sample data only."),
+        ("Could not open the paired host administration app.", "Could not open the paired host administration app."),
+        ("slatehop_about_origin", "SlateHop is based on the open-source {} project and built for remote connections between Macs and Mac minis."),
+        ("slatehop_upstream_source", "{} upstream source"),
+        ("slatehop_upstream_copyright", "{} upstream copyright"),
     ].iter().cloned().collect();
 }

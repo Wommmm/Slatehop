@@ -43,10 +43,28 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
 /// If it returns [`Some`], the action determines whether to start the UI or report failure.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<CoreMainAction> {
+    #[cfg(target_os = "macos")]
+    if std::env::args().skip(1).eq(["--rental-expiry"]) {
+        return crate::rental::print_current_expiry()
+            .err()
+            .map(CoreMainAction::ExitFailure);
+    }
     if !crate::common::global_init() {
         return None;
     }
     crate::load_custom_client();
+    #[cfg(target_os = "macos")]
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--rental-admin-status" | "--rental-admin-set-expiry" | "--rental-admin-new-password")
+    ) {
+        // Parse the original arguments before the ordinary GUI argument filter.
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        return match run_rental_admin(&args) {
+            Ok(()) => None,
+            Err(err) => Some(CoreMainAction::ExitFailure(err)),
+        };
+    }
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -879,6 +897,19 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+#[cfg(target_os = "macos")]
+fn run_rental_admin(args: &[String]) -> hbb_common::ResultType<()> {
+    use std::io::Write;
+    let uid = unsafe { hbb_common::libc::geteuid() };
+    let command = crate::rental::AdminCommand::parse(Some(uid), args)?;
+    let reply = crate::ipc::rental_admin(command)?;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &reply)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
