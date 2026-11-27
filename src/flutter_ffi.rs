@@ -2780,6 +2780,16 @@ pub fn main_get_printer_names() -> SyncReturn<String> {
 }
 
 pub fn main_get_common(key: String) -> String {
+    #[cfg(target_os = "macos")]
+    if key.starts_with(crate::personal_access::PREFIX) {
+        return match hbb_common::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(crate::personal_access::dispatch(key)),
+            Err(_) => crate::personal_access::Reply::failed("unavailable").json(),
+        };
+    }
     if key == "is-printer-installed" {
         #[cfg(target_os = "windows")]
         {
@@ -2849,6 +2859,10 @@ pub fn main_get_common(key: String) -> String {
 }
 
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    #[cfg(target_os = "macos")]
+    if key.starts_with(crate::personal_access::PREFIX) {
+        return SyncReturn(crate::personal_access::Reply::failed("unavailable").json());
+    }
     if let Some(args) = key.strip_prefix("resolve-api-server:") {
         let response = match serde_json::from_str::<(String, String)>(args) {
             Ok((api, custom)) => serde_json::json!({"url": crate::get_api_server(api, custom)}),

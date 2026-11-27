@@ -765,7 +765,17 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                                 );
                                 #[cfg(not(target_os = "windows"))]
                                 {
-                                    if Config::set(config) {
+                                    #[cfg(target_os = "macos")]
+                                    let changed = if conn.peer_uid()
+                                        == Some(unsafe { hbb_common::libc::geteuid() })
+                                    {
+                                        Config::adopt_daemon_snapshot(config)
+                                    } else {
+                                        Config::set(config)
+                                    };
+                                    #[cfg(not(target_os = "macos"))]
+                                    let changed = Config::set(config);
+                                    if changed {
                                         log::info!("config synced");
                                     }
                                     if Config2::set(config2) {

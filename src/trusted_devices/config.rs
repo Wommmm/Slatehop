@@ -45,6 +45,19 @@ pub async fn update_auth<T: Send + 'static>(
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 pub fn sync_config(value: Config, options: Config2) -> ResultType<()> {
+    #[cfg(target_os = "macos")]
+    let _credential_lock = lock_legacy_password_changes(true, || password_changed(&value))?;
+    apply_config_sync(value, options)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_main_config(value: Config, options: Config2) -> ResultType<()> {
+    let _credential_lock = lock_legacy_password_changes(false, || password_changed(&value))?;
+    apply_config_sync(value, options)
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
+fn apply_config_sync(value: Config, options: Config2) -> ResultType<()> {
     let _storage = super::storage()?;
     Config::set(value);
     Config2::set(options.clone());
@@ -232,9 +245,44 @@ pub fn set_options(options: HashMap<String, String>) -> ResultType<()> {
 }
 
 pub fn set_password(value: &str) -> ResultType<bool> {
+    #[cfg(target_os = "macos")]
+    let _credential_lock = lock_legacy_password_changes(false, || Ok(changes_password(value)))?;
+    set_host_password(value)
+}
+
+// On macOS the authenticated personal and rental callers hold the credential lock.
+pub(crate) fn set_host_password(value: &str) -> ResultType<bool> {
     change(changes_password(value), || {
         Ok(Config::set_permanent_password(value))
     })
+}
+
+#[cfg(target_os = "macos")]
+fn lock_legacy_password_changes(
+    protected_config_sync: bool,
+    changed: impl FnOnce() -> ResultType<bool>,
+) -> ResultType<std::sync::MutexGuard<'static, ()>> {
+    let guard = crate::personal_access::password_operations().map_err(|error| anyhow!(error))?;
+    if changed()? {
+        crate::personal_access::require_legacy_password_write(protected_config_sync)
+            .map_err(|error| anyhow!(error))?;
+    }
+    Ok(guard)
+}
+
+#[cfg(target_os = "macos")]
+fn password_changed(value: &Config) -> ResultType<bool> {
+    Ok(password(&Config::get())? != password(value)?)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn set_synced_password(storage: &str, salt: &str) -> ResultType<()> {
+    let _credential_lock = lock_legacy_password_changes(false, || {
+        let (current_storage, current_salt) = Config::get_local_permanent_password_storage_and_salt();
+        Ok(current_storage != storage || current_salt != salt)
+    })?;
+    Config::set_permanent_password_storage_for_sync(storage, salt)?;
+    Ok(())
 }
 
 pub fn changes_password(value: &str) -> bool {
@@ -255,6 +303,10 @@ pub fn changes_password(value: &str) -> bool {
 }
 
 pub fn set_salt(salt: &str) -> ResultType<()> {
+    #[cfg(target_os = "macos")]
+    let _credential_lock = lock_legacy_password_changes(false, || {
+        Ok(Config::get_local_permanent_password_storage_and_salt().1 != salt)
+    })?;
     let affected = Config::get_local_permanent_password_storage_and_salt().1 != salt;
     change(affected, || {
         Config::set_salt(salt);
@@ -263,6 +315,8 @@ pub fn set_salt(salt: &str) -> ResultType<()> {
 }
 
 pub fn set_config(value: Config) -> ResultType<bool> {
+    #[cfg(target_os = "macos")]
+    let _credential_lock = lock_legacy_password_changes(false, || password_changed(&value))?;
     let affected =
         normalize(password(&Config::get())?, false) != normalize(password(&value)?, false);
     change(affected, || Ok(Config::set(value)))

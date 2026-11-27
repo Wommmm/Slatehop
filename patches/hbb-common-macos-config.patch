@@ -1,0 +1,26 @@
+diff --git a/src/config.rs b/src/config.rs
+index 9ee5cac..8281271 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1730,6 +1730,21 @@ impl Config {
+         return CONFIG.read().unwrap().clone();
+     }
+
++    /// A GUI startup reply from the same-user daemon can predate a password
++    /// change. Adopt it in memory without writing it back to their shared file.
++    #[cfg(target_os = "macos")]
++    pub fn adopt_daemon_snapshot(cfg: Config) -> bool {
++        let mut current = CONFIG.write().unwrap();
++        if *current == cfg {
++            return false;
++        }
++        let key_pair = cfg.key_pair.clone();
++        *current = cfg;
++        drop(current);
++        Self::invalidate_key_pair_cache_if_changed(&key_pair);
++        true
++    }
++
+     pub fn set(cfg: Config) -> bool {
+         let mut lock = CONFIG.write().unwrap();
+         if *lock == cfg {

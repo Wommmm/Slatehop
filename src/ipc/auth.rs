@@ -725,7 +725,7 @@ impl<T> ConnectionTmpl<T>
 where
     T: AsyncRead + AsyncWrite + std::marker::Unpin + std::os::unix::io::AsRawFd,
 {
-    pub(super) fn peer_uid(&self) -> Option<u32> {
+    pub(crate) fn peer_uid(&self) -> Option<u32> {
         peer_uid_from_fd(self.inner.get_ref().as_raw_fd())
     }
 

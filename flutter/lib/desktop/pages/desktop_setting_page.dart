@@ -27,6 +27,8 @@ import 'package:url_launcher/url_launcher_string.dart';
 
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/login.dart';
+import '../widgets/owner_device_management_page.dart';
+import '../widgets/tabbar_widget.dart' show DesktopTabController;
 import '../widgets/copper_connection_surface.dart';
 import '../widgets/rental_password_settings.dart';
 import '../widgets/slatehop_about.dart';
@@ -63,6 +65,7 @@ enum SettingsTabKey {
   display,
   account,
   printer,
+  ownerDevices,
   about,
 }
 
@@ -89,6 +92,8 @@ class DesktopSettingPage extends StatefulWidget {
         !bind.isDisableSettings() &&
         bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) != 'Y')
       SettingsTabKey.printer,
+    if (isMacOS && !isWeb && !bind.isDisableSettings())
+      SettingsTabKey.ownerDevices,
     SettingsTabKey.about,
   ];
 
@@ -129,6 +134,8 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
         WidgetsBindingObserver {
   late PageController controller;
   late Rx<SettingsTabKey> selectedTab;
+  final _ownerPageVisible = ValueNotifier(false);
+  Worker? _ownerVisibilityWorker;
 
   @override
   bool get wantKeepAlive => true;
@@ -171,6 +178,21 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     if (_glassSettings) _enableNativeBackdrop();
+    if (DesktopSettingPage.tabKeys.contains(SettingsTabKey.ownerDevices)) {
+      final desktopTabState = Get.find<DesktopTabController>().state;
+      void updateOwnerVisibility() {
+        final state = desktopTabState.value;
+        _ownerPageVisible.value =
+            selectedTab.value == SettingsTabKey.ownerDevices &&
+            state.selected >= 0 &&
+            state.selected < state.tabs.length &&
+            state.selectedTabInfo.key == kTabLabelSettingPage;
+      }
+
+      _ownerVisibilityWorker = everAll(
+          [selectedTab, desktopTabState], (_) => updateOwnerVisibility());
+      updateOwnerVisibility();
+    }
     _videoConnTimer =
         periodic_immediate(Duration(milliseconds: 1000), () async {
       if (!mounted) {
@@ -192,6 +214,8 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
   @override
   void dispose() {
     _videoConnTimer?.cancel();
+    _ownerVisibilityWorker?.dispose();
+    _ownerPageVisible.dispose();
     WidgetsBinding.instance.removeObserver(this);
     Get.delete<PageController>(tag: _kSettingPageControllerTag);
     Get.delete<Rx<SettingsTabKey>>(tag: _kSettingPageTabKeyTag);
@@ -232,6 +256,13 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           settingTabs
               .add(_TabInfo(tab, 'Printer', Icons.print_outlined, Icons.print));
           break;
+        case SettingsTabKey.ownerDevices:
+          settingTabs.add(_TabInfo(
+              tab,
+              ownerDeviceManagementLabel(context),
+              Icons.devices_outlined,
+              Icons.devices));
+          break;
         case SettingsTabKey.about:
           settingTabs
               .add(_TabInfo(tab, 'About', Icons.info_outline, Icons.info));
@@ -269,6 +300,9 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           break;
         case SettingsTabKey.printer:
           children.add(const _Printer());
+          break;
+        case SettingsTabKey.ownerDevices:
+          children.add(OwnerDeviceManagementPage(visible: _ownerPageVisible));
           break;
         case SettingsTabKey.about:
           children.add(const _About());

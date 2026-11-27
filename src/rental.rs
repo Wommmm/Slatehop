@@ -276,6 +276,27 @@ pub fn is_host() -> bool {
     let managed = managed || exists_or_inaccessible(&authority_pending(serving_uid()));
     managed
 }
+#[cfg(target_os = "macos")]
+pub(crate) fn any_macos_rental_authority() -> ResultType<bool> {
+    let directory = authority_directory();
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        result => {
+            result?;
+        }
+    }
+    owned_parent(&authority_marker(0), 0)?;
+    for entry in fs::read_dir(directory)? {
+        let name = entry?.file_name();
+        if let Some((uid, suffix)) = name.to_str().and_then(|name| name.split_once('.')) {
+            if matches!(suffix, "enabled" | "json" | "pending") && uid.parse::<u32>().is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn valid_window(from: u64, until: u64) -> bool {
     from < until && until <= MAX_TIMESTAMP_MS
 }
@@ -789,6 +810,9 @@ fn with_provision_transaction<T>(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn provision_transaction(id: String, request: ProvisionRequest) -> ResultType<Policy> {
+    #[cfg(target_os = "macos")]
+    let _credential_lock =
+        crate::personal_access::password_operations().map_err(|error| anyhow!(error))?;
     with_provision_transaction(&authority_pending(serving_uid()), 0, &id, || {
         provision_locked(request)
     })
@@ -822,7 +846,7 @@ fn provision_locked(request: ProvisionRequest) -> ResultType<Policy> {
         "use-permanent-password".into(),
     );
     Config::set_option("approve-mode".into(), "password".into());
-    if !crate::trusted_devices::config::set_password(&request.password)? {
+    if !crate::trusted_devices::config::set_host_password(&request.password)? {
         bail!("Rental credential update failed");
     }
     let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
@@ -866,6 +890,43 @@ fn provision_locked(request: ProvisionRequest) -> ResultType<Policy> {
         bail!("Rental policy persistence failed");
     }
     Ok(policy)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn confirms_local_password(password: &str) -> ResultType<bool> {
+    Ok(confirmed_credential_binding(password)?.is_some())
+}
+
+#[cfg(target_os = "macos")]
+fn confirmed_credential_binding(password: &str) -> ResultType<Option<String>> {
+    let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
+    let Some(mut installed) = config::decode_permanent_password_h1_from_storage(&storage) else {
+        return Ok(None);
+    };
+    let mut candidate = config::compute_permanent_password_h1(password, &salt);
+    let matches = sodiumoxide::utils::memcmp(&installed, &candidate);
+    sodiumoxide::utils::memzero(&mut installed);
+    sodiumoxide::utils::memzero(&mut candidate);
+    if !matches || salt.is_empty() {
+        return Ok(None);
+    }
+
+    // The upstream setter logs persistence errors and can still report success.
+    let expected = binding(&storage, &salt)?;
+    let persisted = read_private(&Config::file())?;
+    let value: hbb_common::toml::Value = hbb_common::toml::from_str(
+        std::str::from_utf8(&persisted).map_err(|_| anyhow!("Credential persistence invalid"))?,
+    )
+    .map_err(|_| anyhow!("Credential persistence invalid"))?;
+    let stored = value
+        .get("password")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let stored_salt = value
+        .get("salt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    Ok((binding(stored, stored_salt)? == expected).then_some(expected))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

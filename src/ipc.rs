@@ -382,6 +382,10 @@ pub enum Data {
     // Debug for the payload is explicitly redacted; no generic Config string.
     RentalProvision(crate::rental::ProvisionRequest),
     RentalProvisionResult(Option<crate::rental::Policy>),
+    #[cfg(target_os = "macos")]
+    PersonalAccess(crate::personal_access::Request),
+    #[cfg(target_os = "macos")]
+    PersonalAccessReply(crate::personal_access::Reply),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     RentalProvisionTransaction(String, crate::rental::ProvisionRequest),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -664,6 +668,10 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                     break;
                                 }
                                 Ok(Some(data)) => {
+                                    #[cfg(target_os = "macos")]
+                                    if !postfix.is_empty() && matches!(&data, Data::PersonalAccess(_)) {
+                                        break;
+                                    }
                                     // On Linux/macOS, the protected `_service` channel is used only for
                                     // syncing config between root service and the active user process.
                                     //
@@ -678,7 +686,7 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                                     if postfix == crate::POSTFIX_SERVICE {
                                         if matches!(&data, Data::SyncConfig(_)) {
-                                            handle(data, &mut stream).await;
+                                            handle(data, &mut stream, true).await;
                                         } else {
                                             log::warn!(
                                                 "Rejected non-sync data on protected _service IPC channel: postfix={}, data_kind={:?}, peer_uid={:?}",
@@ -692,7 +700,7 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
                                         }
                                         continue;
                                     }
-                                    handle(data, &mut stream).await;
+                                    handle(data, &mut stream, false).await;
                                 }
                                 Ok(None) => {
                                     // `Ok(None)` means a complete frame arrived but did not
@@ -881,8 +889,21 @@ fn authorize_rental_administration(stream: &Connection) -> bool {
     true
 }
 
-async fn handle(data: Data, stream: &mut Connection) {
+async fn handle(data: Data, stream: &mut Connection, _protected_sync: bool) {
     match data {
+        #[cfg(target_os = "macos")]
+        Data::PersonalAccess(request) => {
+            use crate::personal_access;
+            let reply = match personal_access_peer(stream.peer_uid(), stream.peer_pid()) {
+                Some(uid) => crate::trusted_devices::config::update(move || {
+                    Ok(personal_access::handle(request, uid))
+                })
+                .await
+                .unwrap_or_else(|_| personal_access::Reply::failed("unavailable")),
+                None => personal_access::Reply::failed("unavailable"),
+            };
+            allow_err!(stream.send(&Data::PersonalAccessReply(reply)).await);
+        }
         Data::RentalProvision(_) => {
             // Older local messages have no transaction fence.
             allow_err!(stream.send(&Data::RentalProvisionResult(None)).await);
@@ -1185,7 +1206,15 @@ async fn handle(data: Data, stream: &mut Connection) {
             let (config, config2) = *configs;
             let _chk = CheckIfRestart::new();
             if let Err(error) = crate::trusted_devices::config::update(move || {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(target_os = "macos")]
+                {
+                    if _protected_sync {
+                        crate::trusted_devices::config::sync_config(config, config2)
+                    } else {
+                        crate::trusted_devices::config::sync_main_config(config, config2)
+                    }
+                }
+                #[cfg(target_os = "linux")]
                 {
                     crate::trusted_devices::config::sync_config(config, config2)
                 }
@@ -1542,6 +1571,43 @@ async fn connect_with_path(ms_timeout: u64, path: &str) -> ResultType<Connection
     Ok(ConnectionTmpl::new(client))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn is_personal_console_user(uid: u32) -> bool {
+    uid != 0 && uid == unsafe { hbb_common::libc::geteuid() } && active_uid() == Some(uid)
+}
+
+#[cfg(target_os = "macos")]
+fn personal_access_peer(uid: Option<u32>, pid: Option<u32>) -> Option<u32> {
+    let uid = uid?;
+    if is_personal_console_user(uid)
+        && ipc_auth::ensure_peer_executable_matches_current_by_pid_opt(pid, "").is_ok()
+    {
+        Some(uid)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn personal_access(
+    request: crate::personal_access::Request,
+) -> crate::personal_access::Reply {
+    use crate::personal_access::Reply;
+    let response: ResultType<Reply> = async {
+        let mut connection = connect(1_000, "").await?;
+        if personal_access_peer(connection.peer_uid(), connection.peer_pid()).is_none() {
+            bail!("Personal access host could not be verified");
+        }
+        timeout(1_000, connection.send(&Data::PersonalAccess(request))).await??;
+        match connection.next_timeout(15_000).await? {
+            Some(Data::PersonalAccessReply(reply)) => Ok(reply),
+            _ => Ok(Reply::failed("unavailable")),
+        }
+    }
+    .await;
+    response.unwrap_or_else(|_| Reply::failed("unavailable"))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[inline]
 fn select_server_uid_for_user_main_ipc(
@@ -1870,6 +1936,9 @@ fn apply_permanent_password_storage_and_salt_payload(payload: Option<&str>) -> R
         bail!("Invalid permanent-password-storage-and-salt payload");
     };
 
+    #[cfg(target_os = "macos")]
+    crate::trusted_devices::config::set_synced_password(storage, salt)?;
+    #[cfg(not(target_os = "macos"))]
     Config::set_permanent_password_storage_for_sync(storage, salt)?;
     Ok(())
 }
@@ -2057,6 +2126,9 @@ pub fn get_id() -> String {
         if !v.is_empty() {
             // update salt also, so that next time reinstallation not causing first-time auto-login failure
             if let Ok(Some(v2)) = get_config("salt") {
+                #[cfg(target_os = "macos")]
+                allow_err!(crate::trusted_devices::config::set_salt(&v2));
+                #[cfg(not(target_os = "macos"))]
                 Config::set_salt(&v2);
             }
             if v != Config::get_id() {
